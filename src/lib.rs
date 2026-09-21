@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     error::Error,
-    fs::{self, create_dir_all},
     path::PathBuf,
     process::{Child, Command},
     sync::{Arc, Mutex},
@@ -45,31 +44,6 @@ pub struct SwayIdleSettings {
     pub enabled: bool,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            debug: false,
-            server: ServerSettings {
-                inhibit_duration: 25,
-                sleep_duration: 5,
-            },
-            ha: Some(HaSettings {
-                host: "http://192.168.1.188:8123".to_string(),
-                token: String::new(),
-                entity: "switch.cuco_cp5d_306c_switch_2".to_string(),
-                enabled: true,
-            }),
-            swayidle: SwayIdleSettings {
-                config_path: format!(
-                    "{}/.config/niri/swayidle.conf",
-                    std::env::var("HOME").unwrap_or_default()
-                ),
-                enabled: true,
-            },
-        }
-    }
-}
-
 /// 共享状态：PipeWire 检测到的活跃音频流集合 + 是否正在播放
 #[derive(Debug, Default)]
 struct PipeWireState {
@@ -97,17 +71,18 @@ pub struct IdleApp {
 }
 
 impl IdleApp {
-    pub fn new(config_from_file: Result<Settings, Box<dyn std::error::Error>>) -> IdleApp {
-        let conn = Connection::new_session().expect("Failed to connect to D-Bus");
-        let config = config_from_file
-            .inspect_err(|_| log::debug!("No config found or parsed. Using the defaults"))
-            .unwrap_or_default();
-        IdleApp {
+    pub fn new(
+        config_from_file: Result<Settings, Box<dyn std::error::Error>>,
+    ) -> Result<IdleApp, Box<dyn std::error::Error>> {
+        let config = config_from_file?;
+        let conn =
+            Connection::new_session().map_err(|e| format!("Failed to connect to D-Bus: {e}"))?;
+        Ok(IdleApp {
             conn,
             config,
             pipewire_state: Arc::new(Mutex::new(PipeWireState::default())),
             inhibit_state: Arc::new(Mutex::new(InhibitState::default())),
-        }
+        })
     }
 
     // We want to check every single media player to see if they are playing
@@ -321,7 +296,8 @@ impl IdleApp {
                                 );
                             }
                             Some(t) => {
-                                if t.elapsed() >= Duration::from_secs(self.config.server.inhibit_duration)
+                                if t.elapsed()
+                                    >= Duration::from_secs(self.config.server.inhibit_duration)
                                 {
                                     log::info!("Turning speaker OFF");
                                     ha_speaker_call(ha, "switch/turn_off");
@@ -383,11 +359,7 @@ fn ha_speaker_call(ha: &HaSettings, service: &str) {
         }
     };
 
-    let result = client
-        .post(&url)
-        .bearer_auth(&ha.token)
-        .json(&body)
-        .send();
+    let result = client.post(&url).bearer_auth(&ha.token).json(&body).send();
 
     match result {
         Ok(resp) => {
@@ -479,7 +451,9 @@ fn run_pipewire_monitor(
                             })
                             .register();
                         // 同时保存 node proxy 和 listener，保证它们存活
-                        proxies_clone.borrow_mut().push((Box::new(node), Box::new(listener)));
+                        proxies_clone
+                            .borrow_mut()
+                            .push((Box::new(node), Box::new(listener)));
                     }
                     Err(e) => {
                         log::error!("Failed to bind audio flow node {}: {}", node_id, e);
@@ -512,18 +486,15 @@ fn get_config_path() -> PathBuf {
     path
 }
 
-pub fn read_or_create_config(custom_path: Option<PathBuf>) -> Result<Settings, Box<dyn std::error::Error>> {
+pub fn read_config(custom_path: Option<PathBuf>) -> Result<Settings, Box<dyn std::error::Error>> {
     let config_path = custom_path.unwrap_or_else(get_config_path);
 
     if !config_path.exists() {
-        let default_settings = Settings::default();
-        let config_dir = config_path.parent().unwrap();
-        create_dir_all(config_dir)?;
-        let _ = fs::write(
-            &config_path,
-            toml::to_string_pretty(&default_settings).unwrap(),
-        );
-        return Ok(default_settings);
+        return Err(format!(
+            "Config file not found at {}. Create it first (swaddle has no built-in defaults).",
+            config_path.display()
+        )
+        .into());
     }
 
     Ok(Config::builder()

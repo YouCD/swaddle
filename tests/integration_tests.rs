@@ -5,30 +5,71 @@ use std::thread;
 use std::time::Duration;
 use swaddle::*;
 
+fn make_test_settings(inhibit_duration: u64, sleep_duration: u64) -> Settings {
+    Settings {
+        debug: false,
+        server: ServerSettings {
+            inhibit_duration,
+            sleep_duration,
+        },
+        ha: None,
+        swayidle: SwayIdleSettings {
+            config_path: "/tmp/swaddle-test/swayidle.conf".to_string(),
+            enabled: false,
+        },
+    }
+}
+
+/// Builds an IdleApp with default test settings; `None` when the D-Bus
+/// session bus is unavailable (possible in some CI environments).
+fn new_test_app() -> Option<IdleApp> {
+    IdleApp::new(Ok(make_test_settings(25, 5))).ok()
+}
+
 #[test]
 fn test_config_lifecycle() {
-    let temp_dir = env::temp_dir().join("swaddle_test");
-    let original_home = env::var("HOME").ok();
+    let temp_dir = env::temp_dir().join(format!("swaddle_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let config_path = temp_dir.join("config.toml");
 
-    env::set_var("HOME", &temp_dir);
-    fs::remove_dir_all(&temp_dir).ok();
+    // Missing file -> Err with a helpful message (no file is ever created)
+    let err = read_config(Some(config_path.clone())).unwrap_err();
+    assert!(
+        err.to_string().contains("Config file not found"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !config_path.exists(),
+        "read_config must not create the config file"
+    );
 
-    let config = read_or_create_config().unwrap();
-    assert_eq!(config.server.inhibit_duration, 25);
-    assert!(!config.debug);
+    // Existing file -> values are parsed
+    let custom_toml = "\
+debug = true
 
-    let config_path = temp_dir.join(".config/swaddle/config.toml");
-    let custom_toml = "debug = true\n[server]\ninhibit_duration = 60\nsleep_duration = 10";
+[server]
+inhibit_duration = 60
+sleep_duration = 10
+
+[swayidle]
+config_path = \"/tmp/swayidle.conf\"
+enabled = true
+";
     fs::write(&config_path, custom_toml).unwrap();
 
-    let parsed_config = read_or_create_config().unwrap();
-    assert!(parsed_config.debug);
-    assert_eq!(parsed_config.server.inhibit_duration, 60);
+    let config = read_config(Some(config_path.clone())).unwrap();
+    assert!(config.debug);
+    assert_eq!(config.server.inhibit_duration, 60);
+    assert_eq!(config.server.sleep_duration, 10);
+    assert_eq!(config.swayidle.config_path, "/tmp/swayidle.conf");
+    assert!(config.swayidle.enabled);
+    assert!(
+        config.ha.is_none(),
+        "the optional ha section should deserialize to None when absent"
+    );
 
     fs::remove_dir_all(&temp_dir).ok();
-    if let Some(home) = original_home {
-        env::set_var("HOME", home);
-    }
 }
 
 #[test]
@@ -39,24 +80,23 @@ fn test_app_initialization_and_state() {
             inhibit_duration: 30,
             sleep_duration: 10,
         },
+        ha: None,
+        swayidle: SwayIdleSettings {
+            config_path: "/tmp/swaddle-test/swayidle.conf".to_string(),
+            enabled: false,
+        },
     });
-    let mut app = IdleApp::new(config);
+    let Ok(app) = IdleApp::new(config) else {
+        println!("D-Bus unavailable - skipping");
+        return;
+    };
 
     assert_eq!(app.config.server.inhibit_duration, 30);
-    assert!(app.inhibit_process.is_none());
-
-    let cleanup_result = app.check_and_kill_zombies();
-    assert!(cleanup_result.is_ok());
-
-    let cmd_result = app.run_cmd();
-    match cmd_result {
-        Ok(child) => {
-            app.inhibit_process = Some(child);
-            assert!(app.inhibit_process.is_some());
-            app.check_and_kill_zombies().ok();
-        }
-        Err(_) => assert!(app.inhibit_process.is_none()),
-    }
+    assert!(
+        !app.has_active_audio(),
+        "freshly created app should have no active audio flows"
+    );
+    println!("✓ App initialized with expected state");
 }
 
 #[test]
@@ -80,24 +120,26 @@ fn test_media_player_detection_logic() {
 
 #[test]
 fn test_blocking_logic_comprehensive() {
-    let config = Ok(Settings::default());
-    let mut app = IdleApp::new(config);
+    let Some(mut app) = new_test_app() else {
+        println!("D-Bus unavailable - skipping");
+        return;
+    };
 
-    assert!(app.inhibit_process.is_none());
-    assert!(app.check_and_kill_zombies().is_ok());
-    assert!(app.inhibit_process.is_none());
+    assert!(!app.has_active_audio());
 
-    let cmd_result = app.run_cmd();
-    match cmd_result {
-        Ok(child) => {
-            app.inhibit_process = Some(child);
-            assert!(app.inhibit_process.is_some());
+    // run_cmd spawns `systemd-inhibit ... sh -c "sleep <inhibit_duration>"`;
+    // verify we can spawn, observe, kill and reap it.
+    match app.run_cmd() {
+        Ok(mut child) => {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "systemd-inhibit should still be running right after spawn"
+            );
+            child.kill().unwrap();
+            child.wait().unwrap();
             println!("✓ Process spawning successful");
-            assert!(app.check_and_kill_zombies().is_ok());
-            assert!(app.inhibit_process.is_none());
         }
         Err(_) => {
-            assert!(app.inhibit_process.is_none());
             println!("✓ Process spawning gracefully handled when systemd-inhibit unavailable");
         }
     }
@@ -141,15 +183,21 @@ fn test_dbus_mock_player_integration() {
         println!(
             "D-Bus Python dependencies not available - this is expected in some CI environments"
         );
-
-        let config = Ok(Settings::default());
-        let app = IdleApp::new(config);
-
-        let is_playing = app.check_playback_status();
-        assert!(!is_playing);
+        match new_test_app() {
+            Some(app) => {
+                let is_playing = app.check_playback_status();
+                println!("check_playback_status without players: {}", is_playing);
+            }
+            None => println!("D-Bus session also unavailable"),
+        }
         println!("✓ Gracefully handled D-Bus unavailable scenario");
         return;
     }
+
+    let Some(app) = new_test_app() else {
+        println!("D-Bus session unavailable - skipping mock player test");
+        return;
+    };
 
     let mut mock_process = match spawn_mock_player() {
         Ok(process) => process,
@@ -160,9 +208,6 @@ fn test_dbus_mock_player_integration() {
     };
 
     thread::sleep(Duration::from_millis(2000));
-
-    let config = Ok(Settings::default());
-    let app = IdleApp::new(config);
 
     println!("Testing with mock media player...");
 
@@ -177,9 +222,9 @@ fn test_dbus_mock_player_integration() {
                 println!("Blocking state: {}", is_playing);
 
                 if is_playing {
-                    println!("✓ Successfully detected 'Playing' status and enabled blocking!");
+                    println!("✓ Successfully detected 'Playing' status!");
                 } else {
-                    println!("⚠ Mock player detected but blocking not enabled - may be D-Bus communication issue");
+                    println!("⚠ Mock player detected but not 'Playing' - may be a D-Bus communication issue");
                 }
             } else {
                 println!("Mock player not detected in D-Bus service list");

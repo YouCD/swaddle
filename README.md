@@ -45,18 +45,44 @@ exec = /usr/local/bin/swaddle &
 
 Then reload your configuration or restart Sway/Hyprland.
 
-### Configuration File (Optional)
+### Configuration File (Required)
 
-The first time swaddle is run it will create a config file 
-under `$HOME/.config/swaddle/config.toml`.
+Swaddle reads its configuration from `$HOME/.config/swaddle/config.toml`.
+There are no built-in defaults — create the file before running swaddle:
 
-You can also create / overwrite the config with the following options  
+```toml
+debug = false
 
-| Name | Value | Explaination | Default |
-| ---- | ----- | ------------ | ------- |
-|debug|boolean|should swaddle be run in debug mode|<span style="color:grey">false</span>|
+[server]
+inhibit_duration = 25
+sleep_duration = 5
+
+[ha]
+host = "http://192.168.1.1:8123"
+token = "your-long-lived-access-token"
+entity = "switch.my_speaker"
+enabled = true
+
+[swayidle]
+config_path = "/home/you/.config/sway/swayidle.conf"
+enabled = true
+```
+
+The `ha` section is optional — omit it to disable speaker control.  
+
+| Name | Value | Explaination |
+| ---- | ----- | ------------ |
+|debug|boolean|should swaddle be run in debug mode|
 |server|table|includes the options to tweak how swaddle operates||
-|server.inhibit_duration|integer|number of seconds to inhibit per cycle|<span style="color:grey">25</span>|
-|server.sleep_duration|integer|number of seconds to wait between checks|<span style="color:grey">5</span>|
+|server.inhibit_duration|integer|number of seconds to inhibit per cycle|
+|server.sleep_duration|integer|number of seconds to wait between checks|
+|ha|table|optional Home Assistant speaker control section||
+|ha.host|string|Home Assistant base URL, e.g. `http://192.168.1.1:8123`|
+|ha.token|string|Home Assistant long-lived access token|
+|ha.entity|string|entity id of the speaker switch|
+|ha.enabled|boolean|enable / disable speaker control|
+|swayidle|table|swayidle process management section||
+|swayidle.config_path|string|path to the swayidle config file to run with|
+|swayidle.enabled|boolean|enable / disable swayidle management|
 
 ---
